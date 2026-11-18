@@ -44,6 +44,18 @@ class QuotedThinkEnd(unittest.TestCase):
             self.assertEqual(joined(evs, "reasoning"), 'say "')
             self.assertEqual(joined(evs, "content"), "")
 
+    def test_an_escaped_mention_stays_reasoning(self):
+        """A model that types the tag escaped ("the marker `\\n</think>`") puts its quote a couple of
+        characters back; the character right before the tag is then the "n" of the typed "\\n"."""
+        for quote in ("the marker `\\n</think>\\n\\n` appears once",
+                      'say "\\n</think>\\n" and stop'):
+            text = "plan\n" + quote + "\ndone\n</think>\n\nanswer"
+            for width in WIDTHS:
+                with self.subTest(quote=quote[:20], width=width):
+                    evs = run(text, width)
+                    self.assertEqual(joined(evs, "reasoning"), "plan\n" + quote + "\ndone\n")
+                    self.assertEqual(joined(evs, "content"), "answer")
+
     def test_an_unquoted_tag_ends_the_thinking(self):
         for width in WIDTHS:
             evs = run("plan</think>answer", width)

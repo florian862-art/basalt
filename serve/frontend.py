@@ -991,20 +991,38 @@ class OutputParser:
 
     def _reasoning(self, text: str) -> Event:
         """A reasoning event for text going out; remembers its last character for the quote check."""
-        self.rtail = text[-1:] or self.rtail
+        self.rtail = (self.rtail + text)[-4:] if text else self.rtail
         return Event("reasoning", text)
 
     def _quoted_think_end(self, i: int) -> bool | None:
-        """Whether the `</think>` at self.buf[i] is the model quoting the tag while it thinks: written right after a
-        quote or backtick and followed by anything but a line break. None while the character after it has not
-        arrived."""
-        before = self.buf[i - 1] if i else self.rtail
+        """Whether the `</think>` at self.buf[i] is the model quoting the tag while it thinks rather than ending
+        its reasoning: a TYPED escape right before it (the model is writing ABOUT the tag), or a quote that OPENS
+        a quotation.  The end of the thinking is followed by a line break.  None while the character after the
+        tag has not arrived."""
+        before = self.buf[i - 1] if i else self.rtail[-1:]
         if before not in ('"', "'", "`"):
+            context = self.buf[:i] if i >= 2 else self.rtail + self.buf[:i]
+            # (a) a TYPED escape ("`\n</think>\n\n`") means the model is writing ABOUT the tag.  The
+            # typed "\n" ends the text before the tag and its quote sits two characters further back;
+            # a real end is followed by a line break, never by a typed "\n".  Held while the character
+            # after the tag has not arrived, and ONLY in this shape, so every other end is decided
+            # exactly when the tag is complete (the Responses reasoning_tokens count depends on it).
+            if context[-2:] == "\\n" and any(c in ('"', "'", "`") for c in context[-4:]):
+                after = self.buf[i + len(THINK_END):]
+                if not after:
+                    return None
+                return after[0] == "\\" or after[0] not in "\r\n"
             return False
         after = self.buf[i + len(THINK_END):]
         if not after:
             return None
-        return after[0] not in "\r\n"
+        if after[0] == before:                   # the tag inside a pair of quotes
+            return True
+        # (b) #5605: only a quote that OPENS a quotation quotes the tag; a quote closing a
+        # sentence ("only." + tag) precedes the real end
+        context = self.buf[:i] if i >= 2 else self.rtail + self.buf[:i]
+        opens = context[-2:-1] in ("", " ", "\t", "\n", "(", "[", "{", ":")
+        return opens and after[0] not in "\r\n"
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
