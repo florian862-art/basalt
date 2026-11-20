@@ -16,7 +16,7 @@ here), the Qwen3.8 Flash-Next NVFP4/DQ6_K pack, one serving slot.
 |---|---|---|
 | `parser-code-state` | `serve/frontend.py`, `serve/tests/test_stray_backtick.py` | [PR #424](https://github.com/jesdga95/basalt/pull/424) open |
 | `http-body-timeout` | `serve/handler.py`, `serve/tests/test_body_timeout.py` | [PR #425](https://github.com/jesdga95/basalt/pull/425) **merged** ([`d7a9a0f5`](https://github.com/jesdga95/basalt/commit/d7a9a0f5)) |
-| `think-end-quote` | `serve/frontend.py`, `serve/tests/test_quoted_think_end.py` | pushed here, **no PR yet** |
+| `think-end-quote` | `serve/frontend.py`, `serve/tests/test_quoted_think_end.py` | **superseded** — upstream merged [`bc7f2a2a`](https://github.com/jesdga95/basalt/commit/bc7f2a2a) (PR #448, 19.11.) fixing [issue #428](https://github.com/jesdga95/basalt/issues/428), which we reported; our branch is no longer needed once we run a build that contains it |
 | `local-all3` | all three together, on 0.4.1 | local only |
 | `try-0.5.0` | all three rebased onto the 0.5.0 code | local only — this is what our running image contains since 20.11. |
 
@@ -50,7 +50,11 @@ as a runtime) before deciding what to overlay. On 0.5.0:
 |---|---|---|
 | parser code rules (three shapes) | three of four shapes are fine — upstream fixed those; **a call written in an indented block still fires as a call** | yes, until #424 lands |
 | `HTTP_BODY_S` | absent (0 occurrences in the 0.4.1 and the 0.5.0 archive alike) | yes — but #425 is merged upstream and the merge is **after** the 0.5.0 cut, so the next archive must go **without** this overlay, or we would revert upstream's own fix |
-| quoted `</think>` | still broken: reasoning cut to 14 characters, the rest arrives as the answer (at chunk width 1 and whole) | yes; this is now a clean repro for the PR that branch still lacks |
+| quoted `</think>` | still broken in the 0.5.0 archive | yes **for this release** — upstream merged [PR #448](https://github.com/jesdga95/basalt/pull/448) on 19.11. (our issue #428), and we verified the shape passes on current `main`: the next archive goes without it |
+
+So of the three fixes, **one is still ours to carry**: the parser code rules, until
+#424 lands. #425 and #448 are both merged **after** the 0.5.0 cut, which is why our
+0.5.0 image still overlays both files.
 
 And the other direction, checked on the built image: everything upstream changed in
 these two files for 0.5.0 (`EFFORT`, `hold_back` in `frontend.py`;
@@ -137,15 +141,26 @@ The short decode row is **not** a 0.5.0 regression: the 0.4.1 pair above ran
 **`spec` 4 → 8 did not buy anything here, and 0.5.0 shows why.** Widening the verify
 window from 4 to the default 8, same short prose prompt: decode 151.8 / 158.7 →
 122.3 / 126.6 tok/s, draft acceptance 69–77 % → 59–63 %, experts over PCIe steady at
-29–35 %. 0.5.0 prints `dl` (tokens per window) in the `done` line, which is the number
-that settles it: 69 windows today, smallest 2.1, median 2.4, largest 5.2, and 2.3 in
-every measurement prompt. At `spec 8` the window holds one accepted token plus up to
-seven drafts, but **2.4 tokens per verify window are what actually advance**. The
-window is not the limit, the drafter's depth is — so widening it cannot multiply
-anything (the documentation's 183.9 → 319.8 tok/s compares `spec 0` against `spec 7`:
-off against on, not 4 against 8). Going the other way costs little: at 2.4 tokens per
-window, `spec 4` gives up little advance while verifying half as many candidates. Our
-next run moves `spec` alone and reads `dl` alongside the decode rate.
+29–35 %. 0.5.0 prints `dl` in the `done` line — the code computes it as generated
+tokens (after the first) over verify windows, i.e. what a window actually delivers —
+and that is the number that settles it. A controlled probe on 0.5.0 (220-token
+answers, nothing else in the single slot, two prompt shapes, two runs each):
+
+| prompt shape | decode | drafts accepted | `dl` | experts over PCIe |
+|---|---|---|---|---|
+| prose | 116.6 / 148.5 tok/s | 61 / 76 % | 2.9 | 28.4 % |
+| a 14-row table | 122.0 / 228.3 tok/s | 93 / 96 % | 2.9 | 21.9 % |
+
+`dl` is 2.9 in all four runs and in every one of the 69 session windows we read that
+morning (2.1 to 5.2). With `spec 8` the window may hold one accepted token plus up to
+seven drafts, but a window delivers ~2.9 tokens whatever the acceptance rate: the
+window is not the binding limit, the drafter's depth is. So widening it cannot
+multiply anything (the documentation's 183.9 → 319.8 tok/s compares `spec 0` against
+`spec 7` — off against on, not 4 against 8), and narrowing it to 4 gives up little
+while verifying half as many candidates. Acceptance, not window size, is where the
+speed is: same length, same `dl`, structured content drafts to 175 tok/s against
+prose's 133. The `spec 4` single-variable run is staged and waits for the next engine
+start; it will be read from `dl` and the decode rate together.
 
 **Why we do not read the prompt rate from `timings.prompt_per_second`.** On cold
 prompts it reported 82,160,000 tok/s for 8,216 tokens (exactly `prompt_tokens × 10⁴`)
