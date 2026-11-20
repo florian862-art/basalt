@@ -174,6 +174,19 @@ deep drafts offered, fewer rejected). **We keep `spec 4`**: half the verify work
 nothing measurable given up. Acceptance, not window size, is where the speed is: same
 length, same `dl`, structured content drafts to 175 tok/s against prose's 133.
 
+**Hy4 measured on the same stage (20.11., `basalt-test:try-main`, `ctx=262144 kv=fp8
+spec=4`):** `dl=2.0` in every `done` line (acceptance 67/72 % on prose, 99 % on
+a table), decode 45.5 tok/s prose and 63.4 tok/s structured, expert traffic 47–62 %
+over PCIe. So `spec 4` is confirmed on both packs. Hy4 is 2.3–2.8× slower to
+read a prefix (8K: 1363 vs 3134 tok/s; 32K: 1653 vs 5844) and ~2.4× slower
+to decode (44.8 vs 108.3 tok/s) — a different, larger model, not a regression.
+**The 158K prompt is refused**: it grows to 189482 positions and trips `elastic
+KV: … would take the expert tier below the 1293 slots a prompt chunk needs (about
+108299 fit)`, even with the advertised 262144 context; a shorter prompt (~108K) or
+different tier headroom is needed. `/metrics` reports `spec 4 · mtp_max 0` for Hy4
+against `spec 6 · mtp_max 4` for Flash-Next on `spec=4` — more reason to label the
+stage from the start line and `dl`, not from those fields.
+
 **Why we do not read the prompt rate from `timings.prompt_per_second`.** On cold
 prompts it reported 82,160,000 tok/s for 8,216 tokens (exactly `prompt_tokens × 10⁴`)
 and 197,427,500 tok/s for 157,942 tokens on 0.4.1; on 0.5.0 the same prompt reports
