@@ -151,16 +151,28 @@ answers, nothing else in the single slot, two prompt shapes, two runs each):
 | prose | 116.6 / 148.5 tok/s | 61 / 76 % | 2.9 | 28.4 % |
 | a 14-row table | 122.0 / 228.3 tok/s | 93 / 96 % | 2.9 | 21.9 % |
 
-`dl` is 2.9 in all four runs and in every one of the 69 session windows we read that
-morning (2.1 to 5.2). With `spec 8` the window may hold one accepted token plus up to
-seven drafts, but a window delivers ~2.9 tokens whatever the acceptance rate: the
-window is not the binding limit, the drafter's depth is. So widening it cannot
-multiply anything (the documentation's 183.9 → 319.8 tok/s compares `spec 0` against
-`spec 7` — off against on, not 4 against 8), and narrowing it to 4 gives up little
-while verifying half as many candidates. Acceptance, not window size, is where the
-speed is: same length, same `dl`, structured content drafts to 175 tok/s against
-prose's 133. The `spec 4` single-variable run is staged and waits for the next engine
-start; it will be read from `dl` and the decode rate together.
+Then the same prompt shapes at `spec 4`, same engine, same day, the config change as
+the only variable:
+
+| prompt shape | decode | drafts accepted | `dl` | experts over PCIe |
+|---|---|---|---|---|
+| prose | 105.7 / 132.2 tok/s | 71 / 68 % | 2.6 / 2.5 | 25.4 / 30.2 % |
+| a 14-row table | 136.4 / 195.8 tok/s | 99 / 98 % | 2.6 | 24.3 / 25.4 % |
+
+`dl` is 2.9 in all four `spec 8` runs and in every one of the 69 session windows we
+read that morning (2.1 to 5.2). With `spec 8` the window may hold one accepted token
+plus up to seven drafts, but a window delivers ~2.9 tokens whatever the acceptance
+rate: the window is not the binding limit, the drafter's depth is. So widening it
+cannot multiply anything (the documentation's 183.9 → 319.8 tok/s compares `spec 0`
+against `spec 7` — off against on, not 4 against 8). And `spec 4` confirms it from the
+other side: `dl` drops only 2.9 → 2.6 — which is also the proof the narrower window is
+really running, since `GET /metrics` labels these fields unclearly (it pairs `spec 6 ·
+mtp_max 4` with a start line and config of `spec=4`) — while throughput stays inside
+the noise (the two prose runs of one stage alone spread 27 %, the stage mean differs by
+10 %) and acceptance rises at the structured prompt (99–98 % against 93–96 %: fewer
+deep drafts offered, fewer rejected). **We keep `spec 4`**: half the verify work,
+nothing measurable given up. Acceptance, not window size, is where the speed is: same
+length, same `dl`, structured content drafts to 175 tok/s against prose's 133.
 
 **Why we do not read the prompt rate from `timings.prompt_per_second`.** On cold
 prompts it reported 82,160,000 tok/s for 8,216 tokens (exactly `prompt_tokens × 10⁴`)
