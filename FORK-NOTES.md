@@ -1,9 +1,10 @@
-# Fork notes — our three fixes, and how we run 0.4.1 on this machine
+# Fork notes — our three fixes, and how we run the release build on this machine
 
 This page is ours, not upstream documentation. It records which branches carry our
 fixes, how we apply them to a release archive (we do not build from source), how the
-engine is configured on this host, and the measurements behind those values. When we
-change one of these, we change this page.
+engine is configured on this host, and the measurements behind those values. We run
+0.5.0 since 20.11., 0.4.1 before; each release entry says which one a number came
+from. When we change one of these, we change this page.
 
 The host, so the numbers can be placed: two GPUs with 16.3 GiB each, 184 GiB RAM, a
 CPU without AVX-512 (the loader's `expert kernels run on AVX-2` warning is normal
@@ -11,36 +12,50 @@ here), the Qwen3.8 Flash-Next NVFP4/DQ6_K pack, one serving slot.
 
 ## Branches and where each one stands
 
-| branch | files | status (18.11.) |
+| branch | files | status (20.11.) |
 |---|---|---|
 | `parser-code-state` | `serve/frontend.py`, `serve/tests/test_stray_backtick.py` | [PR #424](https://github.com/jesdga95/basalt/pull/424) open |
-| `http-body-timeout` | `serve/handler.py`, `serve/tests/test_body_timeout.py` | [PR #425](https://github.com/jesdga95/basalt/pull/425) open |
+| `http-body-timeout` | `serve/handler.py`, `serve/tests/test_body_timeout.py` | [PR #425](https://github.com/jesdga95/basalt/pull/425) **merged** ([`d7a9a0f5`](https://github.com/jesdga95/basalt/commit/d7a9a0f5)) |
 | `think-end-quote` | `serve/frontend.py`, `serve/tests/test_quoted_think_end.py` | pushed here, **no PR yet** |
-| `local-all3` | all three together | local only — this is what our running image contains |
+| `local-all3` | all three together, on 0.4.1 | local only |
+| `try-0.5.0` | all three rebased onto the 0.5.0 code | local only — this is what our running image contains since 20.11. |
 
 [Issue #426](https://github.com/jesdga95/basalt/issues/426) is ours too:
 `tool_call_recovery` is in the parser but no caller can turn it on.
 
 `parser-code-state` and `think-end-quote` both touch `serve/frontend.py`, on
-different parts of it; `local-all3` stacks them and has been the file our agents
-have run against for days.
+different parts of it; the stacked branches are the files our agents have run against
+for days.
 
 ## Applying them to a release archive
 
-We run the shipped `bin/basalt-v0.4.1-linux-x64.tar.gz` and overlay two files, so a
-test image is one build away and no engine internals move:
+We run the shipped archive (`bin/basalt-v0.5.0-linux-x64.tar.gz` since 20.11.,
+0.4.1 before) and overlay two files, so a test image is one build away and no engine
+internals move:
 
 ```dockerfile
 COPY patch/serve/frontend.py /opt/basalt/serve/frontend.py
 COPY patch/serve/handler.py  /opt/basalt/serve/handler.py
 ```
 
-`patch/serve-orig/` holds the archive's own copies, so `diff -r` shows exactly what
-we changed. Because the overlay starts from the **0.4.1 file** and the branches are
-on `main`, our files are not byte-identical to the branch files: the added code
-lines match (checked line by line), comment wording differs where the two base
-versions differ. A rebuild for a newer release has to re-apply the changes, not copy
-the files.
+`patch/serve-orig/` holds the archive's own copies, so `diff -r` shows exactly what we
+changed. The overlay is re-applied per release (branch `try-0.5.0`), never copied from
+the previous release's file: a rebuild has to re-create the changes on the new base.
+
+**What each release still needs, checked rather than assumed.** We run our three cases
+against the *unpatched* archive (`PYTHONPATH` on the extracted archive, the image only
+as a runtime) before deciding what to overlay. On 0.5.0:
+
+| our fix | on bare 0.5.0 | overlay? |
+|---|---|---|
+| parser code rules (three shapes) | three of four shapes are fine — upstream fixed those; **a call written in an indented block still fires as a call** | yes, until #424 lands |
+| `HTTP_BODY_S` | absent (0 occurrences in the 0.4.1 and the 0.5.0 archive alike) | yes — but #425 is merged upstream and the merge is **after** the 0.5.0 cut, so the next archive must go **without** this overlay, or we would revert upstream's own fix |
+| quoted `</think>` | still broken: reasoning cut to 14 characters, the rest arrives as the answer (at chunk width 1 and whole) | yes; this is now a clean repro for the PR that branch still lacks |
+
+And the other direction, checked on the built image: everything upstream changed in
+these two files for 0.5.0 (`EFFORT`, `hold_back` in `frontend.py`;
+`checked_return_progress` in `handler.py`) is present in the files we ship, so the
+rebase rolled nothing back.
 
 Checks after every image build: the upstream suites that cover this code
 (`serve/tests/test_content_fences.py`, `test_quoted_call_values.py`,
@@ -100,29 +115,46 @@ else asking the engine during a run. Prompt rate is `prompt_tokens ÷ time to fi
 token`, for the reason at the end of this section; decode rate is the server's own
 `done` line. This is one host and one pack, not a benchmark suite.
 
-| | 0.4.1 with our patches | previous engine on this box |
-|---|---|---|
-8,216-token prompt, first token | 2.58 s (3,189 tok/s) | 3.28 s (2,505) |
-32,715-token prompt | 5.34 s (6,121) | 11.02 s (2,970) |
-157,942-token prompt | 20.1 s (7,857) | 56.6 s (2,788) |
-short prose decode (75 → 220 tokens) | 151.8 / 158.7 tok/s | 92.9 tok/s |
-first token, small prompt | 0.28–0.40 s | 0.68–1.61 s |
+| | 0.5.0, `spec 8` (20.11.) | 0.4.1, `spec 4` (18.11.) | previous engine on this box |
+|---|---|---|---|
+| ≈8,200-token prompt, first token | 2.62 / 3.05 s (3,134 / 2,697 tok/s) | 2.58 s (3,189) | 3.28 s (2,505) |
+| ≈32,700-token prompt | 5.60 s (5,844) | 5.34 s (6,121) | 11.02 s (2,970) |
+| ≈158,000-token prompt | 20.62 s (7,661) | 20.1 s (7,857) | 56.6 s (2,788) |
+| short prose decode (75 → 220 tokens) | 122.7 / 108.3 tok/s | 151.8 / 158.7 tok/s | 92.9 tok/s |
+| first token, small prompt | 0.32–0.41 s | 0.28–0.40 s | 0.68–1.61 s |
 
-**`spec` 4 → 8 did not buy anything here.** Widening the verify window from 4 to the
-default 8, same short prose prompt: decode 151.8 / 158.7 → 122.3 / 126.6 tok/s,
-draft acceptance 69–77 % → 59–63 %, experts over PCIe steady at 29–35 %, 8K prompt
-rate 3,189 → 2,588 / 3,087 tok/s. The extra depths look mostly rejected while their
-verification still costs traffic on a host whose decode sits on the PCIe expert
-stream. Not a clean single-variable run — worker count, `ram-reserve` and the
-conversation cache changed in the same start, and a second conversation shared the
-slot. We are repeating it with only `spec` moved.
+**0.4.1 → 0.5.0 changed prompt processing by nothing we can see.** 158 K: 7,857 →
+7,661 tok/s (−2.5 %), 32 K: 6,121 → 5,844 (−4.5 %). Both cold (`pp=…/0c`), same pack,
+same prompts. That is below our own noise floor: two 8 K readings 13 s apart inside one
+run differ by 16 % (2,697 against 3,134). Load time did move: 26.5 s → 31.8 s for the
+same 69.1 GiB (page-cache state counts in there).
+
+The short decode row is **not** a 0.5.0 regression: the 0.4.1 pair above ran
+`spec 4`, and the 0.4.1 `spec 8` arm measured 122.3 / 126.6 tok/s — today's
+122.7 / 108.3 sit in that band. Three `spec 8` samples (108–127) against two
+`spec 4` samples (152–159) now.
+
+**`spec` 4 → 8 did not buy anything here, and 0.5.0 shows why.** Widening the verify
+window from 4 to the default 8, same short prose prompt: decode 151.8 / 158.7 →
+122.3 / 126.6 tok/s, draft acceptance 69–77 % → 59–63 %, experts over PCIe steady at
+29–35 %. 0.5.0 prints `dl` (tokens per window) in the `done` line, which is the number
+that settles it: 69 windows today, smallest 2.1, median 2.4, largest 5.2, and 2.3 in
+every measurement prompt. At `spec 8` the window holds one accepted token plus up to
+seven drafts, but **2.4 tokens per verify window are what actually advance**. The
+window is not the limit, the drafter's depth is — so widening it cannot multiply
+anything (the documentation's 183.9 → 319.8 tok/s compares `spec 0` against `spec 7`:
+off against on, not 4 against 8). Going the other way costs little: at 2.4 tokens per
+window, `spec 4` gives up little advance while verifying half as many candidates. Our
+next run moves `spec` alone and reads `dl` alongside the decode rate.
 
 **Why we do not read the prompt rate from `timings.prompt_per_second`.** On cold
 prompts it reported 82,160,000 tok/s for 8,216 tokens (exactly `prompt_tokens × 10⁴`)
-and 197,427,500 tok/s for 157,942 tokens, and 0 when the whole prefix was cached.
-Nothing is claimed about the cause; the field is just not usable for a comparison,
-so the rate above comes from the client's own time to first token. Say the word if a
-reproducible issue would help.
+and 197,427,500 tok/s for 157,942 tokens on 0.4.1; on 0.5.0 the same prompt reports
+263,230,000 tok/s, and it is 0 when the whole prefix was cached. On the same 0.5.0 row
+`acc` says 100 % while `dl` says 2.3 tokens per window, which is another pair of fields
+we cannot reconcile. Nothing is claimed about the cause; the fields are simply not
+usable for a comparison, so the rate above comes from the client's own time to first
+token. Say the word if a reproducible issue would help.
 
 ## Conversation cache: configured, not yet seen working
 
