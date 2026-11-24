@@ -209,8 +209,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     for (int l = 0; l < n_layers_; ++l) {
         const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
         kernels::cpu::NativeFmt f;
-        if (!kernels::cpu::native_fmt(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err, s_.layers[(size_t) l].clamp))
+        if (!kernels::cpu::native_fmt(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err, el.clamp))
             return false;
+        f.gate_softcap = el.gate_softcap;
+        f.up_softcap = el.up_softcap;
         fmt_.push_back(f);
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);

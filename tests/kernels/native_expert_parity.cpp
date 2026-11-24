@@ -1543,6 +1543,86 @@ int check_mxfp4(int gu, int seed) {
             }
         }
     }
+    // (4) MXFP4 gate/up + MXFP4 down with SiTU-GLU softcap (4.0, 25.0) at ERNIE 5.5's 2048 x 2048 latent geometry
+    {
+        constexpr int64_t HE = 2048, FE = 2048;
+        cpu::NativeFmt fe;
+        std::string er;
+        if (!cpu::native_fmt(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, HE, FE, fe, er)) {
+            std::printf("mxfp4/mxfp4: %s\n", er.c_str());
+            ++failures;
+        } else {
+            fe.gate_softcap = 4.0f;
+            fe.up_softcap = 25.0f;
+            std::mt19937 rng(1200 + seed);
+            std::normal_distribution<float> nd(0.f, 1.f);
+            std::vector<uint8_t> blob(fe.bytes);
+            for (auto& b : blob) b = (uint8_t) rng();
+            for (size_t off : {(size_t) 0, fe.up_off, fe.down_off})
+                for (int64_t r = 0; r < HE; ++r)
+                    for (int64_t blk = 0; blk < FE / 32; ++blk)
+                        blob[off + (size_t) r * fe.gu_row + (size_t) blk * 17] = (uint8_t) (117 + rng() % 8);
+            const int NT2 = 2;
+            std::vector<float> x((size_t) NT2 * HE);
+            for (auto& v : x) v = nd(rng);
+            std::vector<std::vector<uint8_t>> act(NT2, std::vector<uint8_t>(cpu::kNativeActBytes));
+            std::vector<std::vector<uint8_t>> hq(NT2, std::vector<uint8_t>(cpu::kNativeHBytes));
+            std::vector<std::vector<float>> ff(NT2, std::vector<float>(FE));
+            std::vector<float> got((size_t) NT2 * HE), ref((size_t) NT2 * HE), ref_q((size_t) NT2 * HE);
+            const void* a[NT2];
+            const void* hp[NT2];
+            float* ffp[NT2];
+            float* op[NT2];
+            for (int k = 0; k < NT2; ++k) {
+                cpu::native_quant_act(fe, x.data() + (size_t) k * HE, act[k].data());
+                a[k] = act[k].data();
+                ffp[k] = ff[k].data();
+                hp[k] = hq[k].data();
+                op[k] = got.data() + (size_t) k * HE;
+            }
+            cpu::native_gu_rows(fe, blob.data(), a, NT2, ffp, 0, (int) FE);
+            for (int k = 0; k < NT2; ++k) cpu::native_quant_h(fe, ff[k].data(), hq[k].data());
+            cpu::native_down_rows(fe, blob.data(), hp, NT2, op, 0, (int) HE);
+            std::vector<float> G((size_t) FE * HE), U((size_t) FE * HE), D((size_t) HE * FE);
+            for (int64_t r = 0; r < FE; ++r) {
+                tm->to_float(blob.data() + (size_t) r * fe.gu_row, G.data() + (size_t) r * HE, HE);
+                tm->to_float(blob.data() + fe.up_off + (size_t) r * fe.up_row, U.data() + (size_t) r * HE, HE);
+                tm->to_float(blob.data() + fe.down_off + (size_t) r * fe.d_row, D.data() + (size_t) r * FE, FE);
+            }
+            std::vector<float> hd((size_t) FE);
+            for (int k = 0; k < NT2; ++k) {
+                std::vector<float> h(FE);
+                for (int64_t r = 0; r < FE; ++r) {
+                    double g = 0, u = 0;
+                    for (int64_t i = 0; i < HE; ++i) {
+                        g += (double) G[(size_t) r * HE + i] * x[(size_t) k * HE + i];
+                        u += (double) U[(size_t) r * HE + i] * x[(size_t) k * HE + i];
+                    }
+                    const double sg = (4.0 * std::tanh(g / 4.0)) * (1.0 / (1.0 + std::exp(-g)));
+                    const double su = 25.0 * std::tanh(u / 25.0);
+                    h[r] = (float) (sg * su);
+                }
+                for (int64_t r = 0; r < HE; ++r) {
+                    double o = 0;
+                    for (int64_t i = 0; i < FE; ++i) o += (double) D[(size_t) r * FE + i] * h[i];
+                    ref[(size_t) k * HE + r] = (float) o;
+                }
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(hq[k].data(), hd.data(), FE);
+                for (int64_t r = 0; r < HE; ++r) {
+                    double o = 0;
+                    for (int64_t i = 0; i < FE; ++i) o += (double) D[(size_t) r * FE + i] * hd[i];
+                    ref_q[(size_t) k * HE + r] = (float) o;
+                }
+            }
+            const double e = rel(got, ref), eq = rel(got, ref_q);
+            const bool ok = e < 3e-2 && eq < 1e-5 && std::isfinite(e);
+            std::printf("mxfp4/mxfp4 (situ 4/25) at %lld x %lld blob %8zu  cpu rel %.2e max abs %.2e (down vs its own q8_0 h: "
+                        "rel %.2e max abs %.2e)  %s\n",
+                        (long long) HE, (long long) FE, fe.bytes, e, maxabs(got, ref), eq, maxabs(got, ref_q),
+                        ok ? "ok" : "FAIL");
+            if (!ok) ++failures;
+        }
+    }
     return failures;
 }
 

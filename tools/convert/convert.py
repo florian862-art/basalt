@@ -928,6 +928,12 @@ def main():
             import checkpoint_inkling2 as I
             I.build(a, Job, fingerprint, die)
             return
+        if checkpoint_model_type(Path(a.checkpoint)) == "ernie5_5_moe":
+            if a.drafter or a.head:
+                ap.error("--drafter and --head go with a qwen35 checkpoint")
+            import checkpoint_ernie55 as E
+            E.build(a, Job, fingerprint, die)
+            return
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return

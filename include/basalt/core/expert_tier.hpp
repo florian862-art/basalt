@@ -45,7 +45,9 @@ struct ExpertTierSpec {
     struct Layer {
         int gu_type = 0, d_type = 0;
         uint64_t offset = 0, blob_bytes = 0;
-        float clamp = 0;   ///< the SwiGLU clamp of the layer's experts (0: none)
+        float clamp = 0;          ///< the SwiGLU clamp of the layer's experts (0: none)
+        float gate_softcap = 0;   ///< > 0: SiTU-GLU softcap on gate (cg * tanh(g/cg) * sigmoid(g))
+        float up_softcap = 0;     ///< > 0: SiTU-GLU softcap on up (cu * tanh(u/cu))
     };
     std::string area;   ///< log area, "basalt <model>"
     std::string name;   ///< the model's name in refusals
