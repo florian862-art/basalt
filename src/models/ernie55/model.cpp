@@ -111,6 +111,10 @@ core::ExpertTierSpec ErnieModel::tier_spec() const {
     s.share_max_tokens = 16384;
     s.share_stride = expert_stride();
     s.lend_segment = kExpertLendSegment;
+    if (dspark_) {
+        const uint64_t dh = dspark_->host_bytes();
+        s.host.bytes = [dh]() { return dh; };
+    }
     return s;
 }
 
@@ -189,6 +193,18 @@ model::Result ErnieModel::plan(const model::LoadRequest& req, core::LoadPlan& re
         reads.add(it);
         dense_bytes += d.bytes;
         dev_.emplace(name, std::move(d));
+    }
+
+    // Load bundled DSpark drafter when present and requested (--spec >= 2)
+    if (pack_.dspark.present && req.spec >= 2) {
+        dspark_ = ErnieDsparkDrafter::plan_load(*this, file, reads, std::max(req.sessions, 1), err);
+        if (!dspark_) return {model::Status::Error, err};
+        basalt::log::info("basalt ernie55",
+                          "dspark drafter: %d stages, block=%d, %.2f GiB GPU %d + %.2f GiB RAM, windows <= %d (--spec 0: off)",
+                          dspark_->n_stages(), dspark_->block_size(),
+                          (double) dspark_->device_bytes() / (double) kGiB, device_,
+                          (double) dspark_->host_bytes() / (double) kGiB,
+                          std::min(req.spec, dspark_->block_size() + 1));
     }
 
     // Plan context against remaining VRAM

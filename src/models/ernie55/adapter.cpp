@@ -2,14 +2,18 @@
 #include "models/ernie55/adapter.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/route_flags.hpp"
 #include "basalt/program/options.hpp"
 #include "models/ernie55/context_policy.hpp"
+#include "models/ernie55/dspark.hpp"
 #include "models/ernie55/meta.hpp"
 #include "models/ernie55/model.hpp"
+
+#include <cstdlib>
 
 namespace basalt::models::ernie55 {
 namespace {
@@ -54,6 +58,15 @@ public:
             o.kv = args.next("--kv");
             return true;
         }
+        if (a == "--spec") {
+            o.spec = std::atoi(args.next("--spec"));
+            o.spec_given = true;
+            return true;
+        }
+        if (a == "--draft-log") {
+            basalt::core::diagnostics().draft_log = args.next("--draft-log");
+            return true;
+        }
         return false;
     }
 
@@ -64,13 +77,21 @@ public:
             basalt::log::error("basalt ernie55", "--kv %s: ERNIE-5.5 supports fp8 (default) or fp16", o.kv.c_str());
             return 2;
         }
+        core::ModelFile file;
+        std::string err;
+        const bool opened = !o.model.empty() && file.open(o.model, err);
+        const bool drafter = opened && file.find("dspark") != nullptr;
+        if (!o.spec_given) {
+            o.spec = drafter ? kDsparkBlock + 1 : 0;
+            if (opened && !drafter) basalt::log::info("basalt ernie55", "no dspark section: plain decode");
+        }
+        if (o.spec >= 2 && o.spec_oracle.empty() && !drafter) {
+            basalt::log::warn("basalt ernie55", "--spec %d off: the pack has no dspark section", o.spec);
+            o.spec = 0;
+        }
         int top_k = 0;
         if (o.route.tail_skip != 0 || o.route.prior != 0.0f) {
-            core::ModelFile file;
-            std::string err;
-            const core::Json* kv = !o.model.empty() && file.open(o.model, err) && file.load_meta(err)
-                                       ? file.meta().get("gguf_kv")
-                                       : nullptr;
+            const core::Json* kv = opened && file.load_meta(err) ? file.meta().get("gguf_kv") : nullptr;
             const core::Json* used = kv ? kv->get("ernie55.expert_used_count") : nullptr;
             top_k = used ? (int) used->num() : 0;
         }

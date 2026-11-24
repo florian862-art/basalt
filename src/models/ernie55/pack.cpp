@@ -168,6 +168,64 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
             return false;
         }
     }
+
+    // Optional bundled DSpark speculative drafter section (`dspark`)
+    p.dspark = DsparkPack{};
+    const core::ModelFile::Section* dsec = p.file.find("dspark");
+    const Json* dj = meta.get("dspark");
+    if (dsec && dj && dj->is_object()) {
+        DsparkPack& dp = p.dspark;
+        dp.n_stages = (int) num_or(dj->get("layers"), 0);
+        dp.block_size = (int) num_or(dj->get("block_size"), 7);
+        dp.noise_token_id = (int) num_or(dj->get("noise_token_id"), 1024);
+        dp.markov_rank = (int) num_or(dj->get("markov_rank"), 256);
+        dp.window = (int) num_or(dj->get("window"), g.window);
+        dp.rope_theta = (float) num_or(dj->get("rope_theta"), g.rope_theta);
+        dp.target_layers = ints(dj->get("target_layers"));
+        const Json* dtj = dj->get("tensors");
+        const Json* dej = dj->get("experts");
+        if (dp.n_stages <= 0 || dp.block_size <= 0 || dp.target_layers.empty() || !dtj || !dtj->is_object() ||
+            !dej || !dej->is_object()) {
+            err = path + ": malformed meta.dspark";
+            return false;
+        }
+        for (int tl : dp.target_layers) {
+            if (tl < 0 || tl >= g.n_layers) {
+                err = path + ": meta.dspark target_layer out of range";
+                return false;
+            }
+        }
+        for (const auto& [name, val] : dtj->members) {
+            if (!val.is_object()) continue;
+            TensorRef tr;
+            tr.name = name;
+            tr.type = (int) num_or(val.get("type_id"), -1);
+            tr.shape = unsigneds(val.get("shape"));
+            const uint64_t rel = (uint64_t) num_or(val.get("offset"), 0);
+            tr.bytes = (uint64_t) num_or(val.get("bytes"), 0);
+            if (tr.type < 0 || tr.bytes == 0 || rel + tr.bytes > dsec->bytes) {
+                err = path + ": malformed dspark tensor " + name;
+                return false;
+            }
+            tr.offset = dsec->offset + rel;
+            dp.tensors.emplace(name, std::move(tr));
+        }
+        const uint64_t erel = (uint64_t) num_or(dej->get("offset"), 0);
+        dp.experts_bytes = (uint64_t) num_or(dej->get("bytes"), 0);
+        dp.n_expert = (int) num_or(dej->get("n_expert"), g.n_expert);
+        dp.blob_bytes = (uint64_t) num_or(dej->get("blob_bytes"), 0);
+        dp.stage_stride = (uint64_t) num_or(dej->get("stage_stride"), 0);
+        const int gu = (int) num_or(dej->get("gu_type"), 0);
+        const int dn = (int) num_or(dej->get("d_type"), 0);
+        if (gu != GGML_TYPE_MXFP4 || dn != GGML_TYPE_MXFP4 || dp.n_expert != g.n_expert || dp.blob_bytes == 0 ||
+            dp.stage_stride != (uint64_t) dp.n_expert * dp.blob_bytes ||
+            dp.experts_bytes != (uint64_t) dp.n_stages * dp.stage_stride || erel + dp.experts_bytes > dsec->bytes) {
+            err = path + ": malformed meta.dspark.experts";
+            return false;
+        }
+        dp.experts_offset = dsec->offset + erel;
+        dp.present = true;
+    }
     return true;
 }
 

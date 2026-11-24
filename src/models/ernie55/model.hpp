@@ -5,6 +5,7 @@
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/model/adapter.hpp"
 #include "models/ernie55/context_policy.hpp"
+#include "models/ernie55/dspark.hpp"
 #include "models/ernie55/pack.hpp"
 
 #include <cstdint>
@@ -67,6 +68,7 @@ public:
     int device() const { return device_; }
     bool cache_fp8() const { return cache_fmt_ == ctxp::CacheFormat::Fp8; }
     ctxp::CacheFormat cache_format() const { return cache_fmt_; }
+    ErnieDsparkDrafter* dspark() const { return dspark_.get(); }
 
 private:
     Pack pack_;
@@ -74,6 +76,7 @@ private:
     std::map<std::string, DevTensor> dev_;
     core::LoadPlan* planning_ = nullptr;
     mutable SharedTier shared_tier_;
+    std::unique_ptr<ErnieDsparkDrafter> dspark_;
     model::GpuCards gpus_;
     model::LoadRequest flags_;
     std::string path_;

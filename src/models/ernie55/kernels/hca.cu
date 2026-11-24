@@ -150,7 +150,7 @@ __global__ void hca_kv_norm_rope_kernel(const float* __restrict__ kv_in, const f
 }
 
 __global__ void hca_win_commit_kernel(const float* __restrict__ kv_rot, const int32_t* __restrict__ pos, int start_t,
-                                      int head_dim, int win_size, uint8_t* __restrict__ win_cache, bool fp8) {
+                                      int head_dim, int win_cap, uint8_t* __restrict__ win_cache, bool fp8) {
     const int t = start_t + blockIdx.x;
     const int tid = threadIdx.x;
     extern __shared__ float sh[];   // [head_dim + 16]
@@ -158,7 +158,7 @@ __global__ void hca_win_commit_kernel(const float* __restrict__ kv_rot, const in
     const float* src = kv_rot + (size_t) t * head_dim;
     for (int c = tid; c < head_dim; c += blockDim.x) sh[c] = src[c];
     __syncthreads();
-    const int slot = pos[t] % win_size;
+    const int slot = pos[t] % win_cap;
     store_hca_row(win_cache, (size_t) slot, sh, head_dim, fp8, red);
 }
 
@@ -261,7 +261,7 @@ __global__ void hca_compress_kernel(const float* __restrict__ ckv, const float* 
 __global__ void hca_attention_kernel(const float* __restrict__ q, const uint8_t* __restrict__ comp_cache,
                                      const uint8_t* __restrict__ win_cache, const float* __restrict__ kv_rot,
                                      const float* __restrict__ attn_sink, const int32_t* __restrict__ pos,
-                                     int n_heads, int head_dim, int win_size, int ratio, bool fp8,
+                                     int n_heads, int head_dim, int win_size, int win_cap, int ratio, bool fp8,
                                      float* __restrict__ out) {
     const int h = blockIdx.x;
     const int t = blockIdx.y;
@@ -331,7 +331,7 @@ __global__ void hca_attention_kernel(const float* __restrict__ q, const uint8_t*
     for (int j = 0; j < win_n; ++j) {
         const int jp = win_start + j;
         if (kv_rot && jp >= pos0) step_f32_row(kv_rot + (size_t) (jp - pos0) * head_dim);
-        else step_cache_row(win_cache, (size_t) (jp % win_size));
+        else step_cache_row(win_cache, (size_t) (jp % win_cap));
     }
 
     const float inv_l = 1.0f / l;
@@ -362,12 +362,13 @@ void hca_kv_norm_rope(const float* kv_in, const float* kv_norm_w, const int32_t*
 }
 
 void hca_win_commit(const float* kv_rot, const int32_t* pos, int n_tokens, int head_dim, int win_size,
-                    uint8_t* win_cache, bool fp8, void* stream) {
+                    uint8_t* win_cache, bool fp8, void* stream, int win_cap) {
     if (n_tokens <= 0) return;
-    const int n_write = n_tokens < win_size ? n_tokens : win_size;
+    const int cap = win_cap > 0 ? win_cap : win_size;
+    const int n_write = n_tokens < cap ? n_tokens : cap;
     const int start_t = n_tokens - n_write;
     const size_t smem = (size_t) (head_dim + 16) * sizeof(float);
-    hca_win_commit_kernel<<<n_write, 256, smem, (cudaStream_t) stream>>>(kv_rot, pos, start_t, head_dim, win_size,
+    hca_win_commit_kernel<<<n_write, 256, smem, (cudaStream_t) stream>>>(kv_rot, pos, start_t, head_dim, cap,
                                                                          win_cache, fp8);
 }
 
@@ -393,11 +394,12 @@ void hca_compress(const float* ckv, const float* cscore, const float* ape, const
 
 void hca_attention(const float* q, const uint8_t* comp_cache, const uint8_t* win_cache, const float* kv_rot,
                    const float* attn_sink, const int32_t* pos, int n_tokens, int n_heads, int head_dim, int win_size,
-                   int ratio, bool fp8, float* out, void* stream) {
+                   int ratio, bool fp8, float* out, void* stream, int win_cap) {
     if (n_tokens <= 0) return;
+    const int cap = win_cap > 0 ? win_cap : win_size;
     const size_t smem = (size_t) (2 * head_dim + 16) * sizeof(float);
     hca_attention_kernel<<<dim3(n_heads, n_tokens), 256, smem, (cudaStream_t) stream>>>(
-        q, comp_cache, win_cache, kv_rot, attn_sink, pos, n_heads, head_dim, win_size, ratio, fp8, out);
+        q, comp_cache, win_cache, kv_rot, attn_sink, pos, n_heads, head_dim, win_size, cap, ratio, fp8, out);
 }
 
 }  // namespace basalt::models::ernie55

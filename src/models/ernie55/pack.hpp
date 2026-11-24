@@ -64,12 +64,38 @@ struct ExpertLayer {
     uint64_t offset = 0, blob_bytes = 0;   ///< offset inside the experts section
 };
 
+struct DsparkPack {
+    bool present = false;
+    int n_stages = 0;
+    int block_size = 7;
+    int noise_token_id = 1024;
+    int markov_rank = 256;
+    int window = 128;
+    float rope_theta = 8000000.f;
+    std::vector<int> target_layers;
+    std::map<std::string, TensorRef> tensors;   ///< offsets are absolute file offsets
+    uint64_t experts_offset = 0;                ///< absolute file offset of stage MXFP4 blobs
+    uint64_t experts_bytes = 0;
+    int n_expert = 0;
+    uint64_t blob_bytes = 0;
+    uint64_t stage_stride = 0;
+
+    const TensorRef* find(const std::string& n) const {
+        auto it = tensors.find(n);
+        return it == tensors.end() ? nullptr : &it->second;
+    }
+    const TensorRef* find(int stage, const char* suffix) const {
+        return find("blk." + std::to_string(stage) + "." + suffix);
+    }
+};
+
 struct Pack {
     core::ModelFile file;
     Geometry geo;
     std::map<std::string, TensorRef> tensors;
     std::vector<ExpertLayer> experts;   ///< indexed by layer 0..n_layers-1
     core::FileRange experts_range;
+    DsparkPack dspark;
 
     const TensorRef* find(const std::string& n) const {
         auto it = tensors.find(n);

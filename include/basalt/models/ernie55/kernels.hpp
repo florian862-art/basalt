@@ -89,9 +89,10 @@ void hca_q_rope(float* q, const int32_t* pos, int n_tokens, int n_heads, int hea
 void hca_kv_norm_rope(const float* kv_in, const float* kv_norm_w, const int32_t* pos, int n_tokens, int head_dim,
                       float rms_eps, const RopeTable& rt, float* kv_rot, void* stream);
 
-/// Commits the trailing min(n_tokens, win_size) rows of kv_rot into sliding-window ring [win, 512] (race-free).
+/// Commits the trailing min(n_tokens, win_cap) rows of kv_rot into sliding-window ring [win_cap, 512] (race-free).
+/// `win_cap <= 0` defaults to `win_size`. Using `win_cap >= win_size + kMaxDecodeWindow` makes speculative rollback lossless.
 void hca_win_commit(const float* kv_rot, const int32_t* pos, int n_tokens, int head_dim, int win_size,
-                    uint8_t* win_cache, bool fp8, void* stream);
+                    uint8_t* win_cache, bool fp8, void* stream, int win_cap = 0);
 
 /// RMSNorm on kv [n_tokens, 512] + forward interleaved RoPE on last 64 dims, writing into sliding-window ring [win, 512].
 void hca_kv_store_window(const float* kv_in, const float* kv_norm_w, const int32_t* pos, int n_tokens, int head_dim,
@@ -106,9 +107,10 @@ void hca_compress(const float* ckv, const float* cscore, const float* ape, const
 /// HCA multi-query attention over compressed blocks [0 .. pos/ratio) + recent window [max(0, pos-win+1) .. pos],
 /// with per-head attention sink `attn_sink[n_heads]`. When `kv_rot != nullptr`, positions >= pos[0] are read from
 /// `kv_rot[(j - pos[0]) * head_dim]` so prefill chunks never race on `win_cache`.
+/// `win_cap <= 0` defaults to `win_size`.
 void hca_attention(const float* q, const uint8_t* comp_cache, const uint8_t* win_cache, const float* kv_rot,
                    const float* attn_sink, const int32_t* pos, int n_tokens, int n_heads, int head_dim, int win_size,
-                   int ratio, bool fp8, float* out, void* stream);
+                   int ratio, bool fp8, float* out, void* stream, int win_cap = 0);
 
 /// Inverse interleaved RoPE on last 64 dims of VHA-mixed attention output [n_tokens, n_heads, head_dim].
 void hca_inv_rope(float* o, const int32_t* pos, int n_tokens, int n_heads, int head_dim, const RopeTable& rt,
@@ -141,5 +143,32 @@ void dsa_indexer_topk_merge(const float* iq, const float* iweights, const uint8_
 void dsa_mla_attention(const float* q, const uint8_t* kv_cache, const void* kv_b_q8, const float* attn_sink,
                        const int32_t* sel_idx, int n_tokens, int n_heads, int qk_nope, int qk_rope, int kv_lora,
                        int v_dim, int sel_width, bool fp8, float* out, void* stream);
+
+// ---- DSpark Speculative Drafter Kernels -----------------------------------------------------------------------
+
+/// Averages the 4 mHC residual streams `res [n_tokens, 4, n_embd]` into `out[t * out_stride + c]`.
+void mhc_stream_mean(const float* res, int n_tokens, int n_embd, float* out, int out_stride, void* stream);
+
+/// RMSNorm + plain interleaved RoPE (last 64 dims) on `kv_in [n_tokens, head_dim]` at positions `pos0 + t`,
+/// storing FP16 rows into `ctx_ring_f16[((pos0 + t) % win_cap) * head_dim]`.
+void dspark_kv_ctx_store(const float* kv_in, const float* kv_norm_w, int64_t pos0, int n_tokens, int head_dim,
+                         int win_cap, float rms_eps, const RopeTable& rt, uint16_t* ctx_ring_f16, void* stream);
+
+/// Bidirectional block + sliding-window context attention for DSpark: each of the `n_block` block rows attends to
+/// valid context positions `[max(ctx_start, pos0 - win_size) .. pos0 - 1]` in `ctx_ring_f16` (indexed `% win_cap`)
+/// PLUS all `n_block` rows in `block_kv` (FP32), with per-head `attn_sink[n_heads]` and scale `1 / sqrt(head_dim)`.
+void dspark_swa_block_attn(const float* q, const uint16_t* ctx_ring_f16, const float* block_kv, const float* attn_sink,
+                           int64_t pos0, int64_t ctx_start, int n_block, int n_heads, int head_dim, int win_size,
+                           int win_cap, float* out, void* stream);
+
+/// Fused Markov bias addition + ERNIE-5.5 multimax (preserving -inf) + GPU argmax over `n_vocab` logits.
+/// `scratch_val` and `scratch_idx` need at least 256 elements each.
+void dspark_markov_multimax_argmax(const float* base_logits, const float* markov_bias, const float* mmr,
+                                   const float* mmt, int n_vocab, float* scratch_val, int32_t* scratch_idx,
+                                   int32_t* out_tok, void* stream);
+
+/// Computes DSpark confidence `sigmoid(dot(conf_w[0:n_embd], hcout_row) + dot(conf_w[n_embd:], markov_embed))`.
+void dspark_confidence(const float* conf_w, const float* hcout_row, const float* markov_embed, int n_embd, int rank,
+                       float* out_conf, void* stream);
 
 }  // namespace basalt::models::ernie55

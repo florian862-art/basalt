@@ -30,6 +30,7 @@ namespace {
 
 constexpr int kMaxDecodeWindow = 8;
 constexpr int kPrefillChunk = 128;
+constexpr int kHcaWinCap = 256;
 constexpr int kHcaFp8RowBytes = 608;
 constexpr int kDsaFp8RowBytes = 656;
 constexpr int kIdxFp4RowBytes = 68;
@@ -97,13 +98,14 @@ public:
 
         hca_.resize((size_t) g_.n_layers);
         dsa_.resize((size_t) g_.n_layers);
+        win_cap_ = std::max(g_.window, kHcaWinCap);
         kv_bytes_ = 0;
         for (int l = 0; l < g_.n_layers; ++l) {
             if (!g_.is_dsa(l)) {
                 const int ratio = std::max(1, g_.compress_ratios[(size_t) l]);
                 const size_t n_comp = (size_t) (ctx / ratio + 2);
                 auto& s = hca_[(size_t) l];
-                s.win_bytes = (size_t) g_.window * hca_row;
+                s.win_bytes = (size_t) win_cap_ * hca_row;
                 s.comp_bytes = n_comp * hca_row;
                 s.state_bytes = (size_t) ratio * (size_t) g_.hca_head_dim * sizeof(float);
                 if (!ck(cudaMalloc(&s.win_cache, s.win_bytes), "hca win_cache", err) ||
@@ -205,6 +207,17 @@ public:
         h_ent_tok_.resize(max_entries);
         prefill::mmq::iota(d_mmq_iota_, maxT, stream_);
 
+        if (m_.dspark()) {
+            drafter_ = m_.dspark();
+            dwin_ = drafter_->open_window();
+            if (dwin_ < 0) {
+                err = "ernie55: more sessions than dspark windows";
+                return false;
+            }
+            if (!dalloc(d_feat_, (size_t) kDsparkWindow * (size_t) drafter_->feature_floats(), "d_feat", err))
+                return false;
+        }
+
         return ck(cudaStreamSynchronize(stream_), "init sync", err);
     }
 
@@ -232,15 +245,59 @@ public:
         return {};
     }
 
+    int max_window() const override {
+        if (!drafter_ || m_.flags().spec < 2) return 1;
+        return std::clamp(m_.flags().spec, 1, std::min(kMaxDecodeWindow, drafter_->block_size() + 1));
+    }
+
+    int window_limit(int64_t pos) const override {
+        if (max_window() <= 1) return 0;
+        const int ratio = g_.compress_ratios.empty() ? 128 : std::max(1, g_.compress_ratios.front());
+        const int rem = ratio - (int) (pos % ratio);
+        return rem < kMaxDecodeWindow ? rem : 0;
+    }
+
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        if (!drafter_) return {model::Status::NotImplemented, "ernie55: no dspark drafter loaded"};
+        std::string err;
+        if (!flush_features(pos, err)) return {model::Status::Error, err};
+        drafter_->forget_from(dwin_, pos);
+        const int want = std::clamp(n, 1, std::min(max_window() - 1, drafter_->block_size()));
+        if (!drafter_->draft(dwin_, anchor, pos, want, stream_, last_draft_, err))
+            return {model::Status::Error, err};
+        return {};
+    }
+
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
+        if (!drafter_) return {model::Status::NotImplemented, "ernie55: no dspark drafter loaded"};
+        n = std::min(max_n, last_draft_.n);
+        std::copy(last_draft_.token, last_draft_.token + n, ids);
+        std::copy(last_draft_.conf, last_draft_.conf + n, conf);
+        return {};
+    }
+
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens <= 0 || r.n_tokens > kMaxDecodeWindow)
             return {model::Status::Error, "ernie55: decode_window n_tokens out of range"};
         if (r.pos < 0 || r.pos + r.n_tokens > m_.context())
             return {model::Status::Refused, "ernie55: context limit reached"};
         std::string err;
+        if (drafter_) {
+            if (r.pos == 0) {
+                drafter_->reset(dwin_);
+                feat_n_ = 0;
+            } else {
+                if (!flush_features(r.pos, err)) return {model::Status::Error, err};
+                drafter_->forget_from(dwin_, r.pos);
+            }
+        }
         if (!forward_rows(r.tokens, r.pos, r.n_tokens, /*want_logits=*/true, err))
             return {model::Status::Error, err};
         last_window_n_ = r.n_tokens;
+        if (drafter_) {
+            feat_pos0_ = r.pos;
+            feat_n_ = r.n_tokens;
+        }
 
         // Sample next token(s)
         kernels::SamplerParams sp = r.sampling ? *r.sampling : kernels::SamplerParams{};
@@ -277,11 +334,26 @@ public:
         if (auto& st = m_.shared_tier(); st.tier) st.tier->forget_use();
         int done = 0;
         std::string err;
+        if (drafter_) {
+            if (r.pos == 0) {
+                drafter_->reset(dwin_);
+                feat_n_ = 0;
+            } else {
+                if (!flush_features(r.pos, err)) return {model::Status::Error, err};
+                drafter_->forget_from(dwin_, r.pos);
+            }
+        }
         while (done < r.n_tokens) {
             if (r.stop && r.stop()) break;
             const int take = std::min(kPrefillChunk, r.n_tokens - done);
             if (!forward_rows(r.tokens + done, r.pos + done, take, /*want_logits=*/false, err))
                 return {model::Status::Error, err};
+            if (drafter_) {
+                const int tap = std::min(take, kDsparkWindow);
+                feat_pos0_ = r.pos + done + take - tap;
+                feat_n_ = tap;
+                if (!flush_features(r.pos + done + take, err)) return {model::Status::Error, err};
+            }
             done += take;
             if (r.progress) r.progress(done);
         }
@@ -646,8 +718,8 @@ private:
                              stream_);
 
                 hca_attention(d_q_, hs.comp_cache, hs.win_cache, d_kv_, (const float*) asink->ptr, d_pos_, T,
-                              g_.hca_heads, g_.hca_head_dim, g_.window, ratio, fp8, d_attn_o_, stream_);
-                hca_win_commit(d_kv_, d_pos_, T, g_.hca_head_dim, g_.window, hs.win_cache, fp8, stream_);
+                              g_.hca_heads, g_.hca_head_dim, g_.window, ratio, fp8, d_attn_o_, stream_, win_cap_);
+                hca_win_commit(d_kv_, d_pos_, T, g_.hca_head_dim, g_.window, hs.win_cache, fp8, stream_, win_cap_);
                 vha_postmix_f32(d_attn_o_, (const float*) vha_m->ptr, T, g_.hca_heads, g_.hca_head_dim, d_attn_o2_, stream_);
                 hca_inv_rope(d_attn_o2_, d_pos_, T, g_.hca_heads, g_.hca_head_dim, hca_rope_, stream_);
 
@@ -773,6 +845,18 @@ private:
 
             mhc_post(d_sub_out_, res, d_mhc_coef_, kHcCoef, T, H, res_next, stream_);
             std::swap(res, res_next);
+
+            // DSpark feature tap: the stream-averaged mHC OUTPUT of each target layer (vLLM-ERNIE taps after layer idx
+            // when idx + 1 is an aux layer, aux = target_layer_ids + 1; target 42 is the final layer's output).
+            if (drafter_) {
+                const int slot = drafter_->feature_slot(l);
+                if (slot >= 0) {
+                    const int tap = std::min(T, kDsparkWindow);
+                    const int t0 = T - tap;
+                    mhc_stream_mean(res + (size_t) t0 * kHcMult * H, tap, H, d_feat_ + (size_t) slot * H,
+                                    drafter_->feature_floats(), stream_);
+                }
+            }
         }
 
         if (want_logits) {
@@ -809,9 +893,17 @@ private:
         dfree(d_exp_w_); dfree(d_x_lat_); dfree(d_lat_sum_); dfree(d_lat_norm_); dfree(d_routed_out_); dfree(d_exp_out_);
         dfree(d_logits_); dfree(d_picks_); dfree(d_lp_scratch_); dfree(d_lp_out_); dfree(d_mmq_bounds_); dfree(d_mmq_iota_);
         dfree(d_xq_); dfree(d_exp_scratch_); dfree(d_grp_ptr_); dfree(d_grp_start_); dfree(d_n_groups_);
-        dfree(d_ent_dst_); dfree(d_ent_tok_);
+        dfree(d_ent_dst_); dfree(d_ent_tok_); dfree(d_feat_);
         if (cublas_) { cublasDestroy(cublas_); cublas_ = nullptr; }
         if (stream_) { cudaStreamDestroy(stream_); stream_ = nullptr; }
+    }
+
+    bool flush_features(int64_t upto, std::string& err) {
+        if (!drafter_ || feat_n_ <= 0) return true;
+        const int q = (int) std::clamp<int64_t>(upto - feat_pos0_, 0, feat_n_);
+        feat_n_ = 0;
+        if (q <= 0) return true;
+        return drafter_->inject_device(dwin_, feat_pos0_, q, d_feat_, stream_, err);
     }
 
     ErnieModel& m_;
@@ -823,9 +915,17 @@ private:
 
     std::vector<HcaLayerState> hca_;
     std::vector<DsaLayerState> dsa_;
+    int win_cap_ = kHcaWinCap;
     int64_t kv_bytes_ = 0;
     int last_window_n_ = 0;
     const float* logit_bias_ = nullptr;
+
+    ErnieDsparkDrafter* drafter_ = nullptr;
+    int dwin_ = -1;
+    float* d_feat_ = nullptr;
+    int64_t feat_pos0_ = 0;
+    int feat_n_ = 0;
+    DsparkDraft last_draft_{};
 
     int32_t *d_pos_ = nullptr, *d_sel_idx_ = nullptr, *d_exp_ids_ = nullptr, *d_picks_ = nullptr;
     int32_t *d_mmq_bounds_ = nullptr, *d_mmq_iota_ = nullptr;
